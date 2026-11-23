@@ -3,8 +3,17 @@
  * Tokens are issued exclusively by Keycloak (RS256) and verified by FastAPI via JWKS.
  */
 
-export const OIDC_AUTHORITY =
+const RAW_OIDC_AUTHORITY =
   import.meta.env.VITE_OIDC_AUTHORITY || 'http://localhost:8180/realms/stockexchange';
+
+export function resolveOidcAuthority(): string {
+  if (RAW_OIDC_AUTHORITY.startsWith('/') && typeof window !== 'undefined') {
+    return `${window.location.origin}${RAW_OIDC_AUTHORITY}`;
+  }
+  return RAW_OIDC_AUTHORITY;
+}
+
+export const OIDC_AUTHORITY = resolveOidcAuthority();
 export const OIDC_CLIENT_ID = import.meta.env.VITE_OIDC_CLIENT_ID || 'stockexchange-web';
 
 const STORAGE_TOKEN_KEY = 'stockexchange.oidc.tokens';

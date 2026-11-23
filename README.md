@@ -34,11 +34,18 @@ npm run build        # Production TypeScript + Vite bundle
 npm run test:e2e     # Playwright end-to-end tests
 ```
 
-## Docker Build
+## Docker Build & Automated CI/CD (Single-Origin AWS Sandbox)
 ```powershell
+# Single-origin reverse-proxy build (default for AWS EC2 / Nginx):
+docker build -t stockexchange-frontend:local .
+
+# Local direct-port development build:
 docker build `
   --build-arg VITE_API_BASE_URL=http://localhost:8000/api/v1 `
   --build-arg VITE_OIDC_AUTHORITY=http://localhost:8180/realms/stockexchange `
   --build-arg VITE_OIDC_CLIENT_ID=stockexchange-web `
   -t stockexchange-frontend:local .
 ```
+
+- **Runtime**: Non-root `nginxinc/nginx-unprivileged:1.27-alpine` listening on port `8080` with `/healthz` healthcheck.
+- **CI/CD**: `.github/workflows/deploy.yml` runs ESLint, TypeScript strict check, Vitest, Vite production build, Playwright Chromium smoke tests, `npm audit`, Docker build + Trivy scan, immutable `sha-<SHA>` Docker Hub publishing, and **GitHub OIDC -> AWS SSM** deployment (zero static AWS keys in GitHub).

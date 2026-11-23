@@ -1,0 +1,224 @@
+name: StockExchange Frontend CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_tag:
+        description: "Optional explicit image tag to deploy (defaults to sha-<GITHUB_SHA::12>)"
+        required: false
+        default: ""
+      skip_build:
+        description: "Skip Docker build/push and deploy an existing (or test-invalid) tag via SSM"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: stockexchange-ec2-deploy-frontend
+  cancel-in-progress: false
+
+jobs:
+  ci-verify:
+    name: Lint, Typecheck, Unit, Build, Playwright Smoke & Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout frontend repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies from lockfile
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: TypeScript strict typecheck
+        run: npm run typecheck
+
+      - name: Unit & component tests (Vitest + RTL)
+        run: npm test
+
+      - name: Build production Vite bundle (single-origin defaults)
+        env:
+          VITE_API_BASE_URL: /api/v1
+          VITE_OIDC_AUTHORITY: /auth/realms/stockexchange
+          VITE_OIDC_CLIENT_ID: stockexchange-web
+          VITE_SANDBOX_MODE: "true"
+        run: npm run build
+
+      - name: Install Playwright Chromium & run UI smoke tests
+        run: |
+          npx playwright install chromium --with-deps
+          npx vite preview --port 4173 --host 127.0.0.1 &
+          PREVIEW_PID=$!
+          sleep 3
+          E2E_BASE_URL=http://127.0.0.1:4173 npx playwright test e2e/smoke.spec.ts --project=chromium
+          kill $PREVIEW_PID || true
+
+      - name: Dependency vulnerability audit (production deps)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Build & scan container image locally (PR / CI gate)
+        run: |
+          docker build \
+            --build-arg VITE_API_BASE_URL=/api/v1 \
+            --build-arg VITE_OIDC_AUTHORITY=/auth/realms/stockexchange \
+            --build-arg VITE_OIDC_CLIENT_ID=stockexchange-web \
+            --build-arg VITE_SANDBOX_MODE=true \
+            -t stockexchange-frontend:ci .
+
+      - name: Trivy container security scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: stockexchange-frontend:ci
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
+  publish-and-deploy:
+    name: Publish to Docker Hub & Deploy to AWS EC2 via OIDC + SSM
+    needs: ci-verify
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
+      vars.DOCKERHUB_USERNAME != '' &&
+      vars.AWS_DEPLOY_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout frontend repository
+        uses: actions/checkout@v4
+
+      - name: Compute immutable release metadata
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::12}"
+          TAG="${{ inputs.deploy_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="sha-${SHORT_SHA}"
+          fi
+          echo "image_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_repo=${{ vars.DOCKERHUB_USERNAME }}/stockexchange-frontend" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Docker Buildx
+        if: ${{ !inputs.skip_build }}
+        uses: docker/setup-buildx-action@v3
+
+      - name: Authenticate to Docker Hub (scoped token)
+        if: ${{ !inputs.skip_build }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push immutable frontend image to Docker Hub
+        if: ${{ !inputs.skip_build }}
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            VITE_API_BASE_URL=/api/v1
+            VITE_OIDC_AUTHORITY=/auth/realms/stockexchange
+            VITE_OIDC_CLIENT_ID=stockexchange-web
+            VITE_SANDBOX_MODE=true
+          tags: |
+            ${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.meta.outputs.image_repo }}:sandbox-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan published image
+        if: ${{ !inputs.skip_build }}
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.image_tag }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
+      - name: Configure AWS credentials via GitHub OIDC (no static AWS keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: stockexchange-fe-${{ github.run_id }}
+
+      - name: Discover tagged StockExchange EC2 instance
+        id: ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:DeployTarget,Values=stockexchange-sandbox-ec2" "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text)
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "ERROR: No running EC2 instance found with tag DeployTarget=stockexchange-sandbox-ec2"
+            exit 1
+          fi
+          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+          echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy frontend via AWS Systems Manager Run Command
+        id: ssm
+        run: |
+          DIGEST="${{ steps.push.outputs.digest }}"
+          if [ -z "$DIGEST" ]; then DIGEST="existing-or-test"; fi
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ steps.ec2.outputs.instance_id }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy StockExchange frontend ${{ steps.meta.outputs.image_tag }}" \
+            --parameters "commands=[\"/opt/stockexchange/scripts/deploy-stockexchange.sh --component frontend --tag ${{ steps.meta.outputs.image_tag }} --commit ${{ github.sha }} --digest ${DIGEST} --namespace ${{ vars.DOCKERHUB_USERNAME }}\"]" \
+            --query "Command.CommandId" \
+            --output text)
+          echo "command_id=${CMD_ID}" >> "$GITHUB_OUTPUT"
+          echo "Waiting for SSM Command ${CMD_ID}..."
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" \
+              --instance-id "${{ steps.ec2.outputs.instance_id }}" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            echo "SSM status ($i/60): $STATUS"
+            if [ "$STATUS" = "Success" ]; then
+              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ steps.ec2.outputs.instance_id }}" --query "StandardOutputContent" --output text
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ steps.ec2.outputs.instance_id }}" --query "StandardOutputContent" --output text
+              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ steps.ec2.outputs.instance_id }}" --query "StandardErrorContent" --output text
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "SSM deployment timed out"
+          exit 1
+
+      - name: Verify live dashboard & frontend-to-backend API routing
+        run: |
+          BASE_URL="${{ vars.APP_PUBLIC_URL }}"
+          if [ -z "$BASE_URL" ]; then
+            BASE_URL="http://${{ steps.ec2.outputs.public_ip }}"
+          fi
+          curl -fsS "${BASE_URL}/" | grep -qi "StockExchange"
+          curl -fsS "${BASE_URL}/health"
+          curl -fsS "${BASE_URL}/api/v1/stocks/FIRSTHOLDCO" | grep -q "NGFBNH000009"
+          echo "Deployed frontend image: ${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.image_tag }} (${{ steps.push.outputs.digest }})"
