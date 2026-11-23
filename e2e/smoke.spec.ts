@@ -75,8 +75,8 @@ test.describe('StockExchange Frontend CI Smoke Suite', () => {
 
     await page.goto('/');
     await expect(page.getByTestId('sandbox-banner')).toBeVisible();
-    await expect(page.getByText('First HoldCo Plc')).toBeVisible();
-    await expect(page.getByText(/TradingView Lightweight Charts/i)).toBeVisible();
+    await expect(page.getByRole('heading', { name: /First HoldCo Plc/i })).toBeVisible();
+    await expect(page.getByRole('link', { name: /TradingView Lightweight Charts/i })).toBeVisible();
 
     await page.goto('/login');
     await expect(page.getByRole('button', { name: /Continue with Keycloak OIDC \(PKCE\)/i })).toBeVisible();
